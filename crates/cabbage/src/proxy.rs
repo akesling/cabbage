@@ -54,9 +54,10 @@ where
         match reader.read(&mut buffer).await? {
             0 => {
                 // EOF reached
-                println!(
+                log::info!(
                     "{}: Connection closed after {} bytes",
-                    direction, total_bytes
+                    direction,
+                    total_bytes
                 );
                 break;
             }
@@ -65,9 +66,11 @@ where
                 writer.flush().await?;
 
                 total_bytes += bytes_read as u64;
-                println!(
+                log::info!(
                     "{}: {} bytes (total: {})",
-                    direction, bytes_read, total_bytes
+                    direction,
+                    bytes_read,
+                    total_bytes
                 );
             }
         }

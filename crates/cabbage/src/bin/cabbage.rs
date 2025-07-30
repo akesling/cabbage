@@ -96,13 +96,11 @@ async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Resu
         let (client_socket, client_addr) = client_listener.accept().await?;
         let target_addr = options.target.clone();
 
-        println!("New connection from {}", client_addr);
+        log::info!("New connection from {}", client_addr);
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_socket, target_addr).await {
-                eprintln!("Connection error: {}", e);
-            }
-        });
+        if let Err(e) = handle_connection(client_socket, target_addr).await {
+            log::error!("Connection error: {}", e);
+        }
     }
 }
 
