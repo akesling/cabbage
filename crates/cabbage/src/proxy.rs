@@ -1,7 +1,8 @@
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use futures_util::SinkExt;
+use redis_protocol::codec::Resp2;
+use tokio::net::TcpStream;
+use tokio_stream::StreamExt;
+use tokio_util::codec::{FramedRead, FramedWrite};
 
 pub async fn handle_connection(
     client_socket: TcpStream,
@@ -9,72 +10,85 @@ pub async fn handle_connection(
 ) -> anyhow::Result<()> {
     // Connect to target server
     let target_socket = TcpStream::connect(&target_addr).await?;
+    log::info!("connected with target at: {}", target_addr);
 
-    // Split sockets
     let (client_read, client_write) = client_socket.into_split();
     let (target_read, target_write) = target_socket.into_split();
 
-    // Forward data from client to target
-    let client_to_target =
-        tokio::spawn(
-            async move { copy_and_log(client_read, target_write, "Client -> Target").await },
-        );
+    let client_reader = FramedRead::new(client_read, Resp2::default());
+    let client_writer = FramedWrite::new(client_write, Resp2::default());
+    let target_reader = FramedRead::new(target_read, Resp2::default());
+    let target_writer = FramedWrite::new(target_write, Resp2::default());
 
-    let target_to_client =
-        tokio::spawn(
-            async move { copy_and_log(target_read, client_write, "Target -> Client").await },
-        );
+    let client_to_target = tokio::spawn(forward_frames(
+        client_reader,
+        target_writer,
+        "Client -> Target",
+        "command",
+    ));
 
-    tokio::select! {
-        result = client_to_target => {
-            if let Err(e) = result? {
-                log::error!("Client to target error: {}", e);
-            }
-        }
-        result = target_to_client => {
-            if let Err(e) = result? {
-                log::error!("Target to client error: {}", e);
-            }
-        }
+    let target_to_client = tokio::spawn(forward_frames(
+        target_reader,
+        client_writer,
+        "Target -> Client",
+        "response",
+    ));
+
+    let (client_result, target_result) = tokio::join!(client_to_target, target_to_client);
+
+    if let Err(e) = client_result.and_then(|r| Ok(r)) {
+        log::error!("Client to target error: {}", e);
+    }
+
+    if let Err(e) = target_result.and_then(|r| Ok(r)) {
+        log::error!("Target to client error: {}", e);
     }
 
     log::info!("Connection closed");
     Ok(())
 }
 
-async fn copy_and_log<R, W>(mut reader: R, mut writer: W, direction: &str) -> anyhow::Result<()>
+async fn forward_frames<R, W>(
+    mut reader: FramedRead<R, Resp2>,
+    mut writer: FramedWrite<W, Resp2>,
+    direction: &str,
+    frame_type: &str,
+) -> anyhow::Result<()>
 where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut buffer = [0u8; 4096];
-    let mut total_bytes = 0u64;
+    let mut frame_count = 0u64;
 
-    loop {
-        match reader.read(&mut buffer).await? {
-            0 => {
-                // EOF reached
+    while let Some(frame_result) = reader.next().await {
+        match frame_result {
+            Ok(frame) => {
+                frame_count += 1;
                 log::info!(
-                    "{}: Connection closed after {} bytes",
+                    "{}: {} #{} - {:?}",
                     direction,
-                    total_bytes
+                    frame_type,
+                    frame_count,
+                    frame
                 );
-                break;
+
+                if let Err(e) = writer.send(frame).await {
+                    log::error!("Failed to send {}: {}", frame_type, e);
+                    break;
+                }
             }
-            bytes_read => {
-                writer.write_all(&buffer[..bytes_read]).await?;
-                writer.flush().await?;
-
-                total_bytes += bytes_read as u64;
-                log::info!(
-                    "{}: {} bytes (total: {})",
-                    direction,
-                    bytes_read,
-                    total_bytes
-                );
+            Err(e) => {
+                log::error!("Error reading {}: {}", frame_type, e);
+                break;
             }
         }
     }
 
+    log::info!(
+        "{} finished after {} {}s",
+        direction,
+        frame_count,
+        frame_type
+    );
     Ok(())
 }

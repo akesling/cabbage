@@ -6,8 +6,11 @@ edition = "2024"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+futures-util = { version = "0.3.31", features = ["sink"] }
 log = { workspace = true }
 rand = { workspace = true }
-redis-protocol = "6.0.0"
+redis-protocol = { workspace = true }
 simplelog = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = { version = "0.1.17", features = ["full"] }
+tokio-util = { workspace = true }
