@@ -8,5 +8,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
+redis-protocol = "6.0.0"
 simplelog = { workspace = true }
 tokio = { workspace = true }

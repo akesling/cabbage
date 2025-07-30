@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Ok, Result, bail};
 use clap::Parser;
+use tokio::net::{TcpListener, TcpStream};
 
 #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
@@ -72,10 +73,43 @@ fn initialize_logging(
     .map_err(|e| e.into())
 }
 
+#[derive(clap::Parser, Debug)]
+struct ProxyOptions {
+    #[arg(long, default_value = "127.0.0.1:5000")]
+    client: String,
+
+    #[arg(long, default_value = "127.0.0.1:6379")]
+    target: String,
+}
+
+async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Result<()> {
+    // Open TCP connection to client and target.
+
+    let client_listener = TcpListener::bind(options.client.clone()).await?;
+
+    loop {
+        let (_socket, _) = client_listener.accept().await?;
+
+        tokio::spawn(async move {
+            // Process each socket
+
+            println!("process socket!");
+            // send bytes log how many bytes
+
+            // receive bytes log how many bytes
+
+            // process(socket).await
+        });
+    }
+
+    Ok(())
+}
+
 #[derive(clap::Subcommand, Debug)]
 enum Command {
     /// Print a random haiku
     Haiku(HaikuOptions),
+    Proxy(ProxyOptions),
 }
 
 #[tokio::main]
@@ -106,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let context = GlobalOptions {};
     match args.command {
         Command::Haiku(options) => haiku(&context, &options).await?,
+        Command::Proxy(options) => proxy(&context, &options).await?,
     }
     Ok(())
 }

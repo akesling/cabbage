@@ -1,3 +1,5 @@
+mod proxy;
+
 use anyhow::anyhow;
 
 pub static HAIKUS: [[&str; 3]; 10] = [
