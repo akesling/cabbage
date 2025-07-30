@@ -98,9 +98,11 @@ async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Resu
 
         log::info!("New connection from {}", client_addr);
 
-        if let Err(e) = handle_connection(client_socket, target_addr).await {
-            log::error!("Connection error: {}", e);
-        }
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(client_socket, target_addr).await {
+                log::error!("Connection error: {}", e);
+            }
+        });
     }
 }
 
