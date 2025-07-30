@@ -4,6 +4,7 @@ use anyhow::{Context as _, Ok, Result, bail};
 use cabbage::proxy::handle_connection;
 use clap::Parser;
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
@@ -99,7 +100,7 @@ async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Resu
         log::info!("New connection from {}", client_addr);
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_socket, target_addr).await {
+            if let Err(e) = handle_connection(client_socket, target_addr, Uuid::new_v4()).await {
                 log::error!("Connection error: {}", e);
             }
         });
