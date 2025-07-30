@@ -1,4 +1,4 @@
-mod proxy;
+pub mod proxy;
 
 use anyhow::anyhow;
 

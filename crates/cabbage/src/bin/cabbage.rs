@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Ok, Result, bail};
+use cabbage::proxy::handle_connection;
 use clap::Parser;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 #[derive(clap::Parser, Debug)]
 #[command(author, version, about, long_about = None, arg_required_else_help = true)]
@@ -83,25 +84,26 @@ struct ProxyOptions {
 }
 
 async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Result<()> {
-    log::info!("Listening on {}", options.client);
     let client_listener = TcpListener::bind(options.client.clone()).await?;
 
+    log::info!(
+        "Proxy listening on {} -> {}",
+        options.client,
+        options.target
+    );
+
     loop {
-        let (_socket, _) = client_listener.accept().await?;
+        let (client_socket, client_addr) = client_listener.accept().await?;
+        let target_addr = options.target.clone();
+
+        println!("New connection from {}", client_addr);
 
         tokio::spawn(async move {
-            // Process each socket
-
-            println!("process socket!");
-            // send bytes log how many bytes
-
-            // receive bytes log how many bytes
-
-            // process(socket).await
+            if let Err(e) = handle_connection(client_socket, target_addr).await {
+                eprintln!("Connection error: {}", e);
+            }
         });
     }
-
-    Ok(())
 }
 
 #[derive(clap::Subcommand, Debug)]
