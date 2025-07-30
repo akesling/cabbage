@@ -2,6 +2,8 @@
 name = "cabbage"
 version = "0.1.0"
 edition = "2024"
+authors = ["Alex Kesling <alex@kesling.co>", "Kyle Beserra <kylebeserra@gmail.com>"]
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = { workspace = true }
