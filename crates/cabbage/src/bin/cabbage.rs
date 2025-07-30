@@ -83,8 +83,7 @@ struct ProxyOptions {
 }
 
 async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Result<()> {
-    // Open TCP connection to client and target.
-
+    log::info!("Listening on {}", options.client);
     let client_listener = TcpListener::bind(options.client.clone()).await?;
 
     loop {
@@ -119,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
 
     let log_levels: Vec<(&str, simplelog::LevelFilter)> = {
         let mut log_levels = BTreeMap::from([
-            // ("cabbage", simplelog::LevelFilter::Debug),
+            ("cabbage", simplelog::LevelFilter::Debug),
             // If compiled via Bazel, "cabbage" binary crate module will be named "bin"
             //("bin", simplelog::LevelFilter::Debug),
         ]);
