@@ -35,7 +35,7 @@ pub async fn handle_connection(
     let client_framed = Framed::new(client_socket, Resp2::default());
     let target_framed = Framed::new(target_socket, Resp2::default());
 
-    let (client_sink, client_stream) = client_framed.split();
+    let (client_sink, mut client_stream) = client_framed.split();
     let target_service = Resp2Service::new(target_framed);
 
     use std::sync::Arc;
@@ -57,73 +57,84 @@ pub async fn handle_connection(
     let cmd_count = command_count.clone();
     let resp_count = response_count.clone();
     let target_service = Arc::new(Mutex::new(target_service));
-    let response_tx_for_drop = response_tx.clone();
 
-    client_stream
-        .for_each_concurrent(None, move |frame_result| {
-            let cmd_count = cmd_count.clone();
-            let resp_count = resp_count.clone();
-            let response_tx = response_tx.clone();
-            let target_service = target_service.clone();
-            async move {
-                match frame_result {
-                    Ok(frame) => {
-                        cmd_count.fetch_add(1, Ordering::Relaxed);
-                        let command_id = Uuid::new_v4();
-                        let command_id_str = command_id.to_string();
+    loop {
+        let Some(frame_result) = client_stream.next().await else {
+            continue;
+        };
 
-                        log::info!(
-                            concat!(
-                                "Client -> Target: ",
-                                "conn={} command={} - {:?}"),
-                            connection_id, command_id_str, frame);
+        match frame_result {
+            Ok(frame) => {
+                let cmd_count = cmd_count.clone();
+                let resp_count = resp_count.clone();
+                let response_tx = response_tx.clone();
+                let target_service = target_service.clone();
 
-                        let is_doc_command = frame == *DOC_REQUEST;
+                cmd_count.fetch_add(1, Ordering::Relaxed);
+                let command_id = Uuid::new_v4();
+                let command_id_str = command_id.to_string();
 
-                        match target_service.lock().await.call(frame).await {
-                            Ok(mut response_stream) => {
-                                // Spawn a task to handle this response stream
-                                tokio::spawn(async move {
-                                    while let Some(response_frame) = response_stream.next().await {
-                                        resp_count.fetch_add(1, Ordering::Relaxed);
-                                        let response_num = resp_count.load(Ordering::Relaxed);
+                log::info!(
+                    concat!("Client -> Target: ", "conn={} command={} - {:?}"),
+                    connection_id,
+                    command_id_str,
+                    frame
+                );
 
-                                        if is_doc_command {
-                                            log::info!(
-                                                concat!(
-                                                    "Target -> Client: ",
-                                                    "conn={} response #{} (last command #{}) - documents"),
-                                                connection_id, response_num, command_id_str);
-                                        } else {
-                                            log::info!(
-                                                concat!(
-                                                    "Target -> Client: ",
-                                                    "conn={} response #{} (last command #{}) - {:?}"),
-                                                connection_id, response_num, command_id_str, response_frame);
-                                        }
+                let is_doc_command = frame == *DOC_REQUEST;
 
-                                        if response_tx.send(response_frame).await.is_err() {
-                                            log::error!("Failed to send response to client channel");
-                                            break;
-                                        }
-                                    }
-                                });
+                match target_service.lock().await.call(frame).await {
+                    Ok(mut response_stream) => {
+                        // Spawn a task to handle this response stream
+                        tokio::spawn(async move {
+                            while let Some(response_frame) = response_stream.next().await {
+                                resp_count.fetch_add(1, Ordering::Relaxed);
+                                let response_num = resp_count.load(Ordering::Relaxed);
+
+                                if is_doc_command {
+                                    log::info!(
+                                        concat!(
+                                            "Target -> Client: ",
+                                            "conn={} response #{} (last command #{}) - documents"
+                                        ),
+                                        connection_id,
+                                        response_num,
+                                        command_id_str
+                                    );
+                                } else {
+                                    log::info!(
+                                        concat!(
+                                            "Target -> Client: ",
+                                            "conn={} response #{} (last command #{}) - {:?}"
+                                        ),
+                                        connection_id,
+                                        response_num,
+                                        command_id_str,
+                                        response_frame
+                                    );
+                                }
+
+                                if response_tx.send(response_frame).await.is_err() {
+                                    log::error!("Failed to send response to client channel");
+                                    break;
+                                }
                             }
-                            Err(e) => {
-                                log::error!("Failed to send command to backend: {}", e);
-                            }
-                        }
+                        });
                     }
                     Err(e) => {
-                        log::error!("Error reading from client: {}", e);
+                        log::error!("Failed to send command to backend: {}", e);
                     }
                 }
             }
-        })
-        .await;
+            Err(e) => {
+                log::error!("Error reading from client: {}", e);
+                break;
+            }
+        }
+    }
 
     // Wait for the forward task to complete
-    drop(response_tx_for_drop); // Close the channel to signal completion
+    drop(response_tx); // Close the channel to signal completion
     if let Err(e) = forward_task.await {
         log::error!("Forward task failed: {}", e);
     }
