@@ -6,6 +6,8 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5.31", features = ["derive"] }
+futures-util = { version = "0.3.31", features = ["sink"] }
+lazy_static = "1.5"
 log = "0.4"
 rand = "0.8.5"
 redis-protocol = { version = "6.0.0", features = ["codec"] }
@@ -15,6 +17,7 @@ serde_json = "1.0"
 simplelog = "0.12.0"
 thiserror = "1.0"
 tokio = { version = "1.40.0", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["full"] }
 tokio-util = { version = "0.7.13", features = ["full"] }
 tower = "0.5"
 tower-service = "0.3"

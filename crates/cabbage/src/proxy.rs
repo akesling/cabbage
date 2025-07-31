@@ -1,8 +1,17 @@
+use anyhow::bail;
 use futures_util::{SinkExt, StreamExt};
+use lazy_static::lazy_static;
 use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
 use tokio_util::{bytes::Bytes, codec::Framed};
 use uuid::Uuid;
+
+lazy_static! {
+    static ref DOC_REQUEST: BytesFrame = BytesFrame::Array(vec![
+        BytesFrame::BulkString(Bytes::from_static(b"COMMAND")),
+        BytesFrame::BulkString(Bytes::from_static(b"DOCS")),
+    ]);
+}
 
 pub async fn handle_connection(
     client_socket: TcpStream,
@@ -39,13 +48,14 @@ pub async fn handle_connection(
                         command_count += 1;
                         let command_id = Uuid::new_v4();
 
-                        log::info!("Client -> Target: command #{} id: {} - {:?}", command_count, command_id, frame);
+                        log::info!(
+                            "Client -> Target: command #{} id: {} - {:?}",
+                            command_count, command_id, frame);
 
-                        is_doc_command = frame == BytesFrame::Array( vec![ BytesFrame::BulkString( Bytes::from("COMMAND")), BytesFrame::BulkString(Bytes::from("DOCS")) ]  );
+                        is_doc_command = frame == *DOC_REQUEST;
 
                         if let Err(e) = target_sink.send(frame).await {
-                            log::error!("Failed to send command to target: {}", e);
-                            break;
+                            bail!("Failed to send command to target: {}", e);
                         }
 
 
@@ -53,8 +63,7 @@ pub async fn handle_connection(
                         client_next = Box::pin(client_stream.next());
                     }
                     Some(Err(e)) => {
-                        log::error!("Error reading from client: {}", e);
-                        break;
+                        bail!("Error reading from client: {}", e);
                     }
                     None => {
                         log::info!("Client connection closed");
@@ -70,21 +79,23 @@ pub async fn handle_connection(
                         response_count += 1;
 
                         if is_doc_command {
-                            log::info!("Target -> Client: response #{} - documents", response_count);
+                            log::info!(
+                                "Target -> Client: response #{} - documents",
+                                response_count);
                         } else {
-                            log::info!("Target -> Client: response #{} - {:?}", response_count, frame);
+                            log::info!(
+                                "Target -> Client: response #{} - {:?}",
+                                response_count, frame);
                         }
 
 
                         if let Err(e) = client_sink.send(frame).await {
-                            log::error!("Failed to send response to client: {}", e);
-                            break;
+                            bail!("Failed to send response to client: {}", e);
                         }
                         target_next = Box::pin(target_stream.next());
                     }
                     Some(Err(e)) => {
-                        log::error!("Error reading from target: {}", e);
-                        break;
+                        bail!("Error reading from target: {}", e);
                     }
                     None => {
                         log::info!("Target connection closed");

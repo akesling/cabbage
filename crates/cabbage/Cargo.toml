@@ -8,12 +8,13 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-futures-util = { version = "0.3.31", features = ["sink"] }
+futures-util = { workspace = true }
+lazy_static = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 redis-protocol = { workspace = true }
 simplelog = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { version = "0.1.17", features = ["full"] }
+tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
