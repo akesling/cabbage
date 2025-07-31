@@ -125,9 +125,114 @@ pub async fn handle_connection(
     Ok(())
 }
 
-struct RedisProxyService {}
+struct RequestMessage {
+    frame: BytesFrame,
+    response_sender: mpsc::Sender<BytesFrame>,
+}
 
-struct FrameStream {
+pub struct Resp2ProxyService {
+    request_sender: mpsc::Sender<ProxyMessage>,
+}
+
+impl Resp2ProxyService {
+    pub fn new(target_framed: Framed<TcpStream, Resp2>) -> Self {
+        let (request_sender, request_receiver) = mpsc::channel::<ProxyMessage>(100);
+
+        // Spawn background task that owns the connection
+        tokio::spawn(proxy_task(target_framed, request_receiver));
+
+        Self { request_sender }
+    }
+}
+
+struct ProxyCloseMessage {
+    conn_sender: tokio::sync::oneshot::Sender<Framed<TcpStream, Resp2>>,
+}
+
+enum ProxyMessage {
+    Request(RequestMessage),
+    #[allow(dead_code)]
+    Close(ProxyCloseMessage),
+}
+
+async fn proxy_task(
+    target_framed: Framed<TcpStream, Resp2>,
+    mut request_receiver: mpsc::Receiver<ProxyMessage>,
+) -> anyhow::Result<()> {
+    let (mut sink, mut stream) = target_framed.split();
+    let mut current_response_sender: Option<mpsc::Sender<BytesFrame>> = None;
+
+    let mut response_next = Box::pin(stream.next());
+    let mut close_sender: Option<tokio::sync::oneshot::Sender<Framed<TcpStream, Resp2>>> = None;
+    loop {
+        tokio::select! {
+            // Handle new requests
+            request = request_receiver.recv() => {
+                match request {
+                    Some(ProxyMessage::Request(RequestMessage { frame, response_sender })) => {
+                        // Update current response sender for this request
+                        current_response_sender = Some(response_sender);
+
+                        // Send request to target
+                        if let Err(e) = sink.send(frame).await {
+                            log::error!("Failed to send request to target: {}", e);
+                            break;
+                        }
+                    }
+                    Some(ProxyMessage::Close(ProxyCloseMessage { conn_sender })) => {
+                        close_sender = Some(conn_sender);
+                        break;
+                    }
+                    None => {
+                        log::info!("Request channel closed, shutting down connection handler");
+                        break;
+                    }
+                }
+            }
+
+            // Handle responses from target
+            response = &mut response_next => {
+                match response {
+                    Some(Ok(frame)) => {
+                        if let Some(ref sender) = current_response_sender {
+                            if sender.send(frame).await.is_err() {
+                                // Response channel closed, stop sending responses for this request
+                                drop(current_response_sender.take());
+                            }
+                        } else {
+                            log::error!(
+                                "Response received without a known request to associate: {:?}",
+                                frame);
+                        }
+
+                        response_next = Box::pin(stream.next());
+                    }
+                    Some(Err(e)) => {
+                        log::error!("Error reading response from target: {}", e);
+                        break;
+                    }
+                    None => {
+                        log::info!("Target connection closed");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(conn_sender) = close_sender {
+        let framed = sink.reunite(stream)?;
+        if conn_sender.send(framed).is_err() {
+            bail!(concat!(
+                "Failed to send owned Framed back on receipt of ",
+                "close message in proxy task"
+            ))
+        }
+    }
+    Ok(())
+}
+
+pub struct FrameStream {
     receiver: mpsc::Receiver<BytesFrame>,
 }
 
@@ -146,29 +251,30 @@ impl Stream for FrameStream {
     }
 }
 
-// TODO(akesling): Implement a Service<BytesFrame> -> BytesFrame
-impl Service<BytesFrame> for RedisProxyService {
+impl Service<BytesFrame> for Resp2ProxyService {
     type Response = FrameStream;
     type Error = anyhow::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: BytesFrame) -> Self::Future {
-        // Create a channel for the response stream
-        let (sender, stream) = FrameStream::new(10);
+        let request_sender = self.request_sender.clone();
 
-        // Handle the request in an async block
         let fut = async move {
-            // For now, just echo back the request
-            // In a real implementation, this would forward to Redis
-            if let Err(e) = sender.send(req).await {
-                log::error!("Failed to send response frame: {}", e);
+            let (response_sender, responses) = FrameStream::new(100);
+
+            let request = RequestMessage {
+                frame: req,
+                response_sender,
+            };
+            if let Err(e) = request_sender.send(ProxyMessage::Request(request)).await {
+                bail!("Failed to send request to handler: {}", e);
             }
 
-            Ok(stream)
+            Ok(responses)
         };
 
         Box::pin(fut)
