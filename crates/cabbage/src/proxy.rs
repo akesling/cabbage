@@ -36,14 +36,14 @@ pub async fn handle_connection(
     let target_framed = Framed::new(target_socket, Resp2::default());
 
     let (mut client_sink, mut client_stream) = client_framed.split();
-    let (mut target_sink, mut target_stream) = target_framed.split();
+    let mut target_service = Resp2Service::new(target_framed);
 
     let mut _command_count = 0u64;
     let mut last_command: Option<Uuid> = None;
     let mut response_count = 0u64;
 
     let mut client_next = Box::pin(client_stream.next());
-    let mut target_next = Box::pin(target_stream.next());
+    let mut current_response_stream: Option<FrameStream> = None;
 
     let mut is_doc_command = false;
 
@@ -66,8 +66,13 @@ pub async fn handle_connection(
 
                         is_doc_command = frame == *DOC_REQUEST;
 
-                        if let Err(e) = target_sink.send(frame).await {
-                            bail!("Failed to send command to target: {}", e);
+                        match target_service.call(frame).await {
+                            Ok(response_stream) => {
+                                current_response_stream = Some(response_stream);
+                            }
+                            Err(e) => {
+                                bail!("Failed to send command to backend: {}", e);
+                            }
                         }
 
                         client_next = Box::pin(client_stream.next());
@@ -82,10 +87,16 @@ pub async fn handle_connection(
                 }
             }
 
-            // Handle frames from target -> client
-            frame_result = &mut target_next => {
+            // Handle frames from server -> client
+            frame_result = async {
+                if let Some(ref mut stream) = current_response_stream {
+                    stream.next().await
+                } else {
+                    futures::future::pending().await
+                }
+            }, if current_response_stream.is_some() => {
                 match frame_result {
-                    Some(Ok(frame)) => {
+                    Some(frame) => {
                         response_count += 1;
                         let command_id_str = last_command.map(
                             |u| u.to_string()).unwrap_or("UNKNOWN".to_string());
@@ -107,14 +118,10 @@ pub async fn handle_connection(
                         if let Err(e) = client_sink.send(frame).await {
                             bail!("Failed to send response to client: {}", e);
                         }
-                        target_next = Box::pin(target_stream.next());
-                    }
-                    Some(Err(e)) => {
-                        bail!("Error reading from target: {}", e);
                     }
                     None => {
-                        log::info!("Target connection closed");
-                        break;
+                        // Response stream ended, clear it
+                        current_response_stream = None;
                     }
                 }
             }
@@ -130,34 +137,34 @@ struct RequestMessage {
     response_sender: mpsc::Sender<BytesFrame>,
 }
 
-pub struct Resp2ProxyService {
-    request_sender: mpsc::Sender<ProxyMessage>,
+pub struct Resp2Service {
+    request_sender: mpsc::Sender<Message>,
 }
 
-impl Resp2ProxyService {
+impl Resp2Service {
     pub fn new(target_framed: Framed<TcpStream, Resp2>) -> Self {
-        let (request_sender, request_receiver) = mpsc::channel::<ProxyMessage>(100);
+        let (request_sender, request_receiver) = mpsc::channel::<Message>(100);
 
         // Spawn background task that owns the connection
-        tokio::spawn(proxy_task(target_framed, request_receiver));
+        tokio::spawn(backend_task(target_framed, request_receiver));
 
         Self { request_sender }
     }
 }
 
-struct ProxyCloseMessage {
+struct CloseMessage {
     conn_sender: tokio::sync::oneshot::Sender<Framed<TcpStream, Resp2>>,
 }
 
-enum ProxyMessage {
+enum Message {
     Request(RequestMessage),
     #[allow(dead_code)]
-    Close(ProxyCloseMessage),
+    Close(CloseMessage),
 }
 
-async fn proxy_task(
+async fn backend_task(
     target_framed: Framed<TcpStream, Resp2>,
-    mut request_receiver: mpsc::Receiver<ProxyMessage>,
+    mut request_receiver: mpsc::Receiver<Message>,
 ) -> anyhow::Result<()> {
     let (mut sink, mut stream) = target_framed.split();
     let mut current_response_sender: Option<mpsc::Sender<BytesFrame>> = None;
@@ -169,7 +176,7 @@ async fn proxy_task(
             // Handle new requests
             request = request_receiver.recv() => {
                 match request {
-                    Some(ProxyMessage::Request(RequestMessage { frame, response_sender })) => {
+                    Some(Message::Request(RequestMessage { frame, response_sender })) => {
                         // Update current response sender for this request
                         current_response_sender = Some(response_sender);
 
@@ -179,7 +186,7 @@ async fn proxy_task(
                             break;
                         }
                     }
-                    Some(ProxyMessage::Close(ProxyCloseMessage { conn_sender })) => {
+                    Some(Message::Close(CloseMessage { conn_sender })) => {
                         close_sender = Some(conn_sender);
                         break;
                     }
@@ -225,7 +232,7 @@ async fn proxy_task(
         if conn_sender.send(framed).is_err() {
             bail!(concat!(
                 "Failed to send owned Framed back on receipt of ",
-                "close message in proxy task"
+                "close message in backend task"
             ))
         }
     }
@@ -251,7 +258,7 @@ impl Stream for FrameStream {
     }
 }
 
-impl Service<BytesFrame> for Resp2ProxyService {
+impl Service<BytesFrame> for Resp2Service {
     type Response = FrameStream;
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -270,7 +277,7 @@ impl Service<BytesFrame> for Resp2ProxyService {
                 frame: req,
                 response_sender,
             };
-            if let Err(e) = request_sender.send(ProxyMessage::Request(request)).await {
+            if let Err(e) = request_sender.send(Message::Request(request)).await {
                 bail!("Failed to send request to handler: {}", e);
             }
 
