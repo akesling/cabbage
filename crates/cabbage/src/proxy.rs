@@ -31,7 +31,8 @@ pub async fn handle_connection(
     let (mut client_sink, mut client_stream) = client_framed.split();
     let (mut target_sink, mut target_stream) = target_framed.split();
 
-    let mut command_count = 0u64;
+    let mut _command_count = 0u64;
+    let mut last_command: Option<Uuid> = None;
     let mut response_count = 0u64;
 
     let mut client_next = Box::pin(client_stream.next());
@@ -45,20 +46,22 @@ pub async fn handle_connection(
             frame_result = &mut client_next => {
                 match frame_result {
                     Some(Ok(frame)) => {
-                        command_count += 1;
-                        let command_id = Uuid::new_v4();
+                        _command_count += 1;
+                        last_command = Some(Uuid::new_v4());
 
+                        let command_id_str = last_command.map(
+                            |u| u.to_string()).unwrap_or("UNKNOWN".to_string());
                         log::info!(
-                            "Client -> Target: command #{} id: {} - {:?}",
-                            command_count, command_id, frame);
+                            concat!(
+                                "Client -> Target: ",
+                                "conn={} command={} - {:?}"),
+                            connection_id, command_id_str, frame);
 
                         is_doc_command = frame == *DOC_REQUEST;
 
                         if let Err(e) = target_sink.send(frame).await {
                             bail!("Failed to send command to target: {}", e);
                         }
-
-
 
                         client_next = Box::pin(client_stream.next());
                     }
@@ -77,17 +80,22 @@ pub async fn handle_connection(
                 match frame_result {
                     Some(Ok(frame)) => {
                         response_count += 1;
+                        let command_id_str = last_command.map(
+                            |u| u.to_string()).unwrap_or("UNKNOWN".to_string());
 
                         if is_doc_command {
                             log::info!(
-                                "Target -> Client: response #{} - documents",
-                                response_count);
+                                concat!(
+                                    "Target -> Client: ",
+                                    "conn={} response #{} (last command #{}) - documents"),
+                                connection_id, response_count, command_id_str);
                         } else {
                             log::info!(
-                                "Target -> Client: response #{} - {:?}",
-                                response_count, frame);
+                                concat!(
+                                    "Target -> Client: ",
+                                    "conn={} response #{} (last command #{}) - {:?}"),
+                                connection_id, response_count, command_id_str, frame);
                         }
-
 
                         if let Err(e) = client_sink.send(frame).await {
                             bail!("Failed to send response to client: {}", e);
