@@ -6,6 +6,7 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5.31", features = ["derive"] }
+futures = "0.3.31"
 futures-util = { version = "0.3.31", features = ["sink"] }
 lazy_static = "1.5"
 log = "0.4"

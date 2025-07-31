@@ -1,9 +1,16 @@
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use anyhow::bail;
+use futures::Future;
+use futures::stream::Stream;
 use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_util::{bytes::Bytes, codec::Framed};
+use tower::Service;
 use uuid::Uuid;
 
 lazy_static! {
@@ -117,3 +124,55 @@ pub async fn handle_connection(
     log::info!("Connection closed");
     Ok(())
 }
+
+struct RedisProxyService {}
+
+struct FrameStream {
+    receiver: mpsc::Receiver<BytesFrame>,
+}
+
+impl FrameStream {
+    fn new(buffer_size: usize) -> (mpsc::Sender<BytesFrame>, Self) {
+        let (sender, receiver) = mpsc::channel(buffer_size);
+        (sender, Self { receiver })
+    }
+}
+
+impl Stream for FrameStream {
+    type Item = BytesFrame;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.receiver.poll_recv(cx)
+    }
+}
+
+// TODO(akesling): Implement a Service<BytesFrame> -> BytesFrame
+impl Service<BytesFrame> for RedisProxyService {
+    type Response = FrameStream;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: BytesFrame) -> Self::Future {
+        // Create a channel for the response stream
+        let (sender, stream) = FrameStream::new(10);
+
+        // Handle the request in an async block
+        let fut = async move {
+            // For now, just echo back the request
+            // In a real implementation, this would forward to Redis
+            if let Err(e) = sender.send(req).await {
+                log::error!("Failed to send response frame: {}", e);
+            }
+
+            Ok(stream)
+        };
+
+        Box::pin(fut)
+    }
+}
+
+// TODO(akesling): Implement a "serve()" function which takes a "Listener" and a MakeService

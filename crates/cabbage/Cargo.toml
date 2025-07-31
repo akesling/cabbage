@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
 futures-util = { workspace = true }
 lazy_static = { workspace = true }
 log = { workspace = true }
@@ -17,4 +18,5 @@ simplelog = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
+tower = { workspace = true }
 uuid = { workspace = true }
