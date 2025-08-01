@@ -73,54 +73,46 @@ where
 
     fn call(&mut self, req: BytesFrame) -> Self::Future {
         self.request_count += 1;
-        let is_doc_command = req == *DOC_REQUEST;
+        let req_num = self.request_count;
         let command_id = Uuid::new_v4();
-        let command_id_str = command_id.to_string();
-        let connection_id = self.connection_id.to_string();
 
+        let is_doc_command = req == *DOC_REQUEST;
         log::info!(
-            concat!("Client -> Target: ", "conn={} command={} - {:?}"),
-            connection_id,
-            command_id_str,
+            "Client -> Target: conn={} req#{} cmd={} - {:?}",
+            self.connection_id,
+            req_num,
+            command_id,
             req
         );
 
         let fut = self.resp2_service.call(req);
 
+        let conn_id = self.connection_id.to_string();
         let resp_count = self.response_count.clone();
         Box::pin(async move {
-            let response_num = resp_count.load(atomic::Ordering::Relaxed);
-            let base_stream = fut.await.map_err(Into::into)?;
+            let stream = fut.await.map_err(Into::into)?;
+            let logged = stream.inspect(move |frame| {
+                let n = resp_count.fetch_add(1, atomic::Ordering::Relaxed) + 1;
 
-            // Box the inspect stream directly
-            let result: Box<dyn Stream<Item = BytesFrame> + Send + Unpin> =
-                Box::new(Box::pin(base_stream.inspect(move |resp| {
-                    resp_count.fetch_add(1, atomic::Ordering::Relaxed);
-                    if is_doc_command {
-                        log::info!(
-                            concat!(
-                                "Target -> Client: ",
-                                "conn={} response #{} (last command #{}) - documents"
-                            ),
-                            connection_id,
-                            response_num,
-                            command_id_str
-                        );
-                    } else {
-                        log::info!(
-                            concat!(
-                                "Target -> Client: ",
-                                "conn={} response #{} (last command #{}) - {:?}"
-                            ),
-                            connection_id,
-                            response_num,
-                            command_id_str,
-                            resp
-                        );
-                    }
-                })));
+                if is_doc_command {
+                    log::info!(
+                        "Target -> Client: conn={} resp#{} cmd={} - docs",
+                        conn_id,
+                        n,
+                        command_id
+                    );
+                } else {
+                    log::info!(
+                        "Target -> Client: conn={} resp#{} cmd={} - {:?}",
+                        conn_id,
+                        n,
+                        command_id,
+                        frame
+                    );
+                }
+            });
 
-            Ok(result)
+            Ok(Box::new(Box::pin(logged)) as Self::Response)
         })
     }
 }
