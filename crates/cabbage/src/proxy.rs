@@ -44,20 +44,16 @@ pub async fn handle_connection(
     let command_count = Arc::new(AtomicU64::new(0));
     let response_count = Arc::new(AtomicU64::new(0));
 
-    // Create channels for response routing
-    let (response_tx, response_rx) = mpsc::channel::<BytesFrame>(100);
+    // Create channel for response stream routing
     let (stream_tx, mut stream_rx) = mpsc::channel::<(FrameStream, Uuid, bool)>(100);
 
-    // Spawn single response handling task
+    // Spawn single task to handle response streams and forward to client
     let forward_task = tokio::spawn(async move {
-        let response_tx = response_tx;
         let resp_count = response_count.clone();
+        let mut client_sink = client_sink;
 
-        // Process incoming response streams
+        // Process incoming response streams and forward to client
         while let Some((mut response_stream, command_id, is_doc_command)) = stream_rx.recv().await {
-            let response_tx = response_tx.clone();
-            let resp_count = resp_count.clone();
-
             // Process this response stream
             while let Some(response_frame) = response_stream.next().await {
                 resp_count.fetch_add(1, Ordering::Relaxed);
@@ -87,18 +83,12 @@ pub async fn handle_connection(
                     );
                 }
 
-                if response_tx.send(response_frame).await.is_err() {
-                    log::error!("Failed to send response to client channel");
+                if client_sink.send(response_frame).await.is_err() {
+                    log::error!("Failed to send response to client");
                     return;
                 }
             }
         }
-    });
-
-    // Spawn client forwarding task
-    let client_forward_task = tokio::spawn(async move {
-        let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
-        stream.map(Ok).forward(client_sink).await
     });
 
     // Process client commands and route responses
@@ -148,13 +138,10 @@ pub async fn handle_connection(
         }
     }
 
-    // Close channels and wait for tasks to complete
+    // Close channel and wait for task to complete
     drop(stream_tx); // Close the stream channel to signal no more response streams
     if let Err(e) = forward_task.await {
         log::error!("Forward task failed: {}", e);
-    }
-    if let Err(e) = client_forward_task.await {
-        log::error!("Client forward task failed: {}", e);
     }
 
     log::info!("Connection closed");
