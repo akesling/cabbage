@@ -6,7 +6,6 @@ use std::task::{Context, Poll};
 
 use futures::Future;
 use futures::stream::Stream;
-use futures_util::StreamExt;
 use lazy_static::lazy_static;
 use redis_protocol::resp2::types::BytesFrame;
 use tokio_util::bytes::Bytes;
@@ -30,10 +29,7 @@ impl<'conn> ProxyLoggerLayer<'conn> {
     }
 }
 
-impl<'conn, S> Layer<S> for ProxyLoggerLayer<'conn>
-where
-    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
-{
+impl<'conn, S> Layer<S> for ProxyLoggerLayer<'conn> {
     type Service = ProxyLogger<'conn, S>;
 
     fn layer(&self, service: S) -> Self::Service {
@@ -41,20 +37,14 @@ where
     }
 }
 
-pub struct ProxyLogger<
-    'conn,
-    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
-> {
+pub struct ProxyLogger<'conn, S> {
     resp2_service: S,
     connection_id: &'conn str,
     request_count: u64,
     response_count: Arc<AtomicU64>,
 }
 
-impl<'conn, S> ProxyLogger<'conn, S>
-where
-    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
-{
+impl<'conn, S> ProxyLogger<'conn, S> {
     fn new(resp2_service: S, connection_id: &'conn str) -> Self {
         Self {
             resp2_service,
@@ -65,9 +55,10 @@ where
     }
 }
 
-impl<'conn, S> Service<BytesFrame> for ProxyLogger<'conn, S>
+impl<'conn, S, St> Service<BytesFrame> for ProxyLogger<'conn, S>
 where
-    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
+    S: Service<BytesFrame, Response = St>,
+    St: Stream<Item = BytesFrame> + Send + Unpin + 'static,
     S::Error: Into<anyhow::Error>,
     S::Future: Send + 'static,
 {
@@ -97,39 +88,63 @@ where
 
         let resp_count = self.response_count.clone();
         Box::pin(async move {
+            resp_count.fetch_add(1, atomic::Ordering::Relaxed);
             let response_num = resp_count.load(atomic::Ordering::Relaxed);
             let base_stream = fut.await.map_err(Into::into)?;
 
-            // Use Box::pin to make the mapped stream Unpin
-            let mapped_stream = base_stream.map(move |resp| {
-                if is_doc_command {
-                    log::info!(
-                        concat!(
-                            "Target -> Client: ",
-                            "conn={} response #{} (last command #{}) - documents"
-                        ),
-                        connection_id,
-                        response_num,
-                        command_id_str
-                    );
-                } else {
-                    log::info!(
-                        concat!(
-                            "Target -> Client: ",
-                            "conn={} response #{} (last command #{}) - {:?}"
-                        ),
-                        connection_id,
-                        response_num,
-                        command_id_str,
-                        resp
-                    );
-                }
-                resp
-            });
+            // Create a wrapper struct that implements Stream
+            struct LoggingStream<S> {
+                inner: S,
+                is_doc: bool,
+                connection_id: String,
+                response_num: u64,
+                command_id_str: String,
+            }
 
-            let resp_stream: Box<dyn Stream<Item = BytesFrame> + Send + Unpin> =
-                Box::new(Box::pin(mapped_stream));
-            Ok(resp_stream)
+            impl<S: Stream<Item = BytesFrame> + Unpin> Stream for LoggingStream<S> {
+                type Item = BytesFrame;
+
+                fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                    match Pin::new(&mut self.inner).poll_next(cx) {
+                        Poll::Ready(Some(resp)) => {
+                            if self.is_doc {
+                                log::info!(
+                                    concat!(
+                                        "Target -> Client: ",
+                                        "conn={} response #{} (last command #{}) - documents"
+                                    ),
+                                    self.connection_id,
+                                    self.response_num,
+                                    self.command_id_str
+                                );
+                            } else {
+                                log::info!(
+                                    concat!(
+                                        "Target -> Client: ",
+                                        "conn={} response #{} (last command #{}) - {:?}"
+                                    ),
+                                    self.connection_id,
+                                    self.response_num,
+                                    self.command_id_str,
+                                    resp
+                                );
+                            }
+                            Poll::Ready(Some(resp))
+                        }
+                        other => other,
+                    }
+                }
+            }
+
+            let logging_stream = LoggingStream {
+                inner: base_stream,
+                is_doc: is_doc_command,
+                connection_id,
+                response_num,
+                command_id_str,
+            };
+
+            Ok(Box::new(logging_stream) as Box<dyn Stream<Item = BytesFrame> + Send + Unpin>)
         })
     }
 }
