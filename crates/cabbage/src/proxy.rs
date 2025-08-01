@@ -24,6 +24,7 @@ lazy_static! {
     ]);
 }
 
+// TODO(akesling): Add connection timeout, etc.
 pub async fn handle_connection(
     client_socket: TcpStream,
     target_addr: String,
@@ -40,57 +41,19 @@ pub async fn handle_connection(
     let target_framed = Framed::new(target_socket, Resp2::default());
 
     let (client_sink, mut client_stream) = client_framed.split();
-    let mut target_service = Resp2Backend::new(target_framed);
-
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    let command_count = Arc::new(AtomicU64::new(0));
-    let response_count = Arc::new(AtomicU64::new(0));
+    let connection_id_string = connection_id.to_string();
+    let logger = ProxyLoggerLayer::new(&connection_id_string);
+    let mut target_service = logger.layer(Resp2Backend::new(target_framed));
 
     // Create channel for response stream routing
-    let (stream_tx, mut stream_rx) = mpsc::channel::<(
-        Box<dyn Stream<Item = BytesFrame> + Send + Unpin>,
-        Uuid,
-        bool,
-    )>(100);
+    let (stream_tx, mut stream_rx) =
+        mpsc::channel::<Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>(100);
 
     // Spawn single task to handle response streams and forward to client
     let forward_task = tokio::spawn(async move {
-        let resp_count = response_count.clone();
         let mut client_sink = client_sink;
-
-        // Process incoming response streams and forward to client
-        while let Some((mut response_stream, command_id, is_doc_command)) = stream_rx.recv().await {
-            // Process this response stream
+        while let Some(mut response_stream) = stream_rx.recv().await {
             while let Some(response_frame) = response_stream.next().await {
-                resp_count.fetch_add(1, Ordering::Relaxed);
-                let response_num = resp_count.load(Ordering::Relaxed);
-                let command_id_str = command_id.to_string();
-
-                if is_doc_command {
-                    log::info!(
-                        concat!(
-                            "Target -> Client: ",
-                            "conn={} response #{} (last command #{}) - documents"
-                        ),
-                        connection_id,
-                        response_num,
-                        command_id_str
-                    );
-                } else {
-                    log::info!(
-                        concat!(
-                            "Target -> Client: ",
-                            "conn={} response #{} (last command #{}) - {:?}"
-                        ),
-                        connection_id,
-                        response_num,
-                        command_id_str,
-                        response_frame
-                    );
-                }
-
                 if client_sink.send(response_frame).await.is_err() {
                     log::error!("Failed to send response to client on connection {connection_id}");
                     return;
@@ -99,9 +62,6 @@ pub async fn handle_connection(
         }
     });
 
-    // Process client commands and route responses
-    let cmd_count = command_count.clone();
-
     loop {
         let Some(frame_result) = client_stream.next().await else {
             break; // End of stream
@@ -109,27 +69,10 @@ pub async fn handle_connection(
 
         match frame_result {
             Ok(frame) => {
-                cmd_count.fetch_add(1, Ordering::Relaxed);
-                let command_id = Uuid::new_v4();
-                let command_id_str = command_id.to_string();
-
-                log::info!(
-                    concat!("Client -> Target: ", "conn={} command={} - {:?}"),
-                    connection_id,
-                    command_id_str,
-                    frame
-                );
-
-                let is_doc_command = frame == *DOC_REQUEST;
-
                 match target_service.call(frame).await {
                     Ok(response_stream) => {
                         // Send the response stream to our single handler task
-                        if stream_tx
-                            .send((response_stream, command_id, is_doc_command))
-                            .await
-                            .is_err()
-                        {
+                        if stream_tx.send(response_stream).await.is_err() {
                             log::error!("Failed to send response stream to handler");
                             break;
                         }
@@ -316,6 +259,12 @@ impl Service<BytesFrame> for Resp2Backend {
 struct ProxyLoggerLayer<'conn> {
     connection_id: &'conn str,
 }
+impl<'conn> ProxyLoggerLayer<'conn> {
+    fn new(connection_id: &'conn str) -> Self {
+        Self { connection_id }
+    }
+}
+
 impl<'conn, S> Layer<S> for ProxyLoggerLayer<'conn>
 where
     S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
