@@ -36,7 +36,7 @@ pub async fn handle_connection(
     let target_framed = Framed::new(target_socket, Resp2::default());
 
     let (client_sink, mut client_stream) = client_framed.split();
-    let mut target_service = Resp2Service::new(target_framed);
+    let mut target_service = Resp2Backend::new(target_framed);
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -84,7 +84,7 @@ pub async fn handle_connection(
                 }
 
                 if client_sink.send(response_frame).await.is_err() {
-                    log::error!("Failed to send response to client");
+                    log::error!("Failed to send response to client on connection {connection_id}");
                     return;
                 }
             }
@@ -153,11 +153,11 @@ struct RequestMessage {
     response_sender: mpsc::Sender<BytesFrame>,
 }
 
-pub struct Resp2Service {
+pub struct Resp2Backend {
     request_sender: mpsc::Sender<Message>,
 }
 
-impl Resp2Service {
+impl Resp2Backend {
     pub fn new(target_framed: Framed<TcpStream, Resp2>) -> Self {
         let (request_sender, request_receiver) = mpsc::channel::<Message>(100);
 
@@ -274,7 +274,7 @@ impl Stream for FrameStream {
     }
 }
 
-impl Service<BytesFrame> for Resp2Service {
+impl Service<BytesFrame> for Resp2Backend {
     type Response = FrameStream;
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -301,6 +301,51 @@ impl Service<BytesFrame> for Resp2Service {
         };
 
         Box::pin(fut)
+    }
+}
+
+struct DocElisionLayer {}
+
+struct DocElider<S: Service<BytesFrame, Response=FrameStream>> {
+    resp2_service: S,
+}
+impl<S: Service<BytesFrame, Response=FrameStream>> Service<BytesFrame> for DocElider<S> {
+    type Response = FrameStream;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: BytesFrame) -> Self::Future {
+        async move {
+            let is_doc_command = req == *DOC_REQUEST;
+            let resp_stream = self.resp2_service.call(req).await;
+            if is_doc_command {
+                log::info!(
+                    concat!(
+                        "Target -> Client: ",
+                        "conn={} response #{} (last command #{}) - documents"
+                    ),
+                    connection_id,
+                    response_num,
+                    command_id_str
+                );
+            } else {
+                log::info!(
+                    concat!(
+                        "Target -> Client: ",
+                        "conn={} response #{} (last command #{}) - {:?}"
+                    ),
+                    connection_id,
+                    response_num,
+                    command_id_str,
+                    response_frame
+                );
+            }
+            resp_stream
+        }
     }
 }
 
