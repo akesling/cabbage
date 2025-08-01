@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use lazy_static::lazy_static;
 use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::{bytes::Bytes, codec::Framed};
 use tower::Service;
 use uuid::Uuid;
@@ -44,30 +44,73 @@ pub async fn handle_connection(
     let command_count = Arc::new(AtomicU64::new(0));
     let response_count = Arc::new(AtomicU64::new(0));
 
-    // Create a channel for response frames to be sent to the client
+    // Create channels for response routing
     let (response_tx, response_rx) = mpsc::channel::<BytesFrame>(100);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<(FrameStream, Uuid, bool)>(100);
 
-    // Spawn response forwarding task
+    // Spawn single response handling task
     let forward_task = tokio::spawn(async move {
+        let response_tx = response_tx;
+        let resp_count = response_count.clone();
+
+        // Process incoming response streams
+        while let Some((mut response_stream, command_id, is_doc_command)) = stream_rx.recv().await {
+            let response_tx = response_tx.clone();
+            let resp_count = resp_count.clone();
+
+            // Process this response stream
+            while let Some(response_frame) = response_stream.next().await {
+                resp_count.fetch_add(1, Ordering::Relaxed);
+                let response_num = resp_count.load(Ordering::Relaxed);
+                let command_id_str = command_id.to_string();
+
+                if is_doc_command {
+                    log::info!(
+                        concat!(
+                            "Target -> Client: ",
+                            "conn={} response #{} (last command #{}) - documents"
+                        ),
+                        connection_id,
+                        response_num,
+                        command_id_str
+                    );
+                } else {
+                    log::info!(
+                        concat!(
+                            "Target -> Client: ",
+                            "conn={} response #{} (last command #{}) - {:?}"
+                        ),
+                        connection_id,
+                        response_num,
+                        command_id_str,
+                        response_frame
+                    );
+                }
+
+                if response_tx.send(response_frame).await.is_err() {
+                    log::error!("Failed to send response to client channel");
+                    return;
+                }
+            }
+        }
+    });
+
+    // Spawn client forwarding task
+    let client_forward_task = tokio::spawn(async move {
         let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
         stream.map(Ok).forward(client_sink).await
     });
 
     // Process client commands and route responses
     let cmd_count = command_count.clone();
-    let resp_count = response_count.clone();
 
     loop {
         let Some(frame_result) = client_stream.next().await else {
-            continue;
+            break; // End of stream
         };
 
         match frame_result {
             Ok(frame) => {
-                let cmd_count = cmd_count.clone();
-                let resp_count = resp_count.clone();
-                let response_tx = response_tx.clone();
-
                 cmd_count.fetch_add(1, Ordering::Relaxed);
                 let command_id = Uuid::new_v4();
                 let command_id_str = command_id.to_string();
@@ -82,42 +125,16 @@ pub async fn handle_connection(
                 let is_doc_command = frame == *DOC_REQUEST;
 
                 match target_service.call(frame).await {
-                    Ok(mut response_stream) => {
-                        // Spawn a task to handle this response stream
-                        tokio::spawn(async move {
-                            while let Some(response_frame) = response_stream.next().await {
-                                resp_count.fetch_add(1, Ordering::Relaxed);
-                                let response_num = resp_count.load(Ordering::Relaxed);
-
-                                if is_doc_command {
-                                    log::info!(
-                                        concat!(
-                                            "Target -> Client: ",
-                                            "conn={} response #{} (last command #{}) - documents"
-                                        ),
-                                        connection_id,
-                                        response_num,
-                                        command_id_str
-                                    );
-                                } else {
-                                    log::info!(
-                                        concat!(
-                                            "Target -> Client: ",
-                                            "conn={} response #{} (last command #{}) - {:?}"
-                                        ),
-                                        connection_id,
-                                        response_num,
-                                        command_id_str,
-                                        response_frame
-                                    );
-                                }
-
-                                if response_tx.send(response_frame).await.is_err() {
-                                    log::error!("Failed to send response to client channel");
-                                    break;
-                                }
-                            }
-                        });
+                    Ok(response_stream) => {
+                        // Send the response stream to our single handler task
+                        if stream_tx
+                            .send((response_stream, command_id, is_doc_command))
+                            .await
+                            .is_err()
+                        {
+                            log::error!("Failed to send response stream to handler");
+                            break;
+                        }
                     }
                     Err(e) => {
                         log::error!("Failed to send command to backend: {}", e);
@@ -131,10 +148,13 @@ pub async fn handle_connection(
         }
     }
 
-    // Wait for the forward task to complete
-    drop(response_tx); // Close the channel to signal completion
+    // Close channels and wait for tasks to complete
+    drop(stream_tx); // Close the stream channel to signal no more response streams
     if let Err(e) = forward_task.await {
         log::error!("Forward task failed: {}", e);
+    }
+    if let Err(e) = client_forward_task.await {
+        log::error!("Client forward task failed: {}", e);
     }
 
     log::info!("Connection closed");
