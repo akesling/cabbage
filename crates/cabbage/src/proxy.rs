@@ -36,7 +36,7 @@ pub async fn handle_connection(
     let target_framed = Framed::new(target_socket, Resp2::default());
 
     let (client_sink, mut client_stream) = client_framed.split();
-    let target_service = Resp2Service::new(target_framed);
+    let mut target_service = Resp2Service::new(target_framed);
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,7 +56,6 @@ pub async fn handle_connection(
     // Process client commands and route responses
     let cmd_count = command_count.clone();
     let resp_count = response_count.clone();
-    let target_service = Arc::new(Mutex::new(target_service));
 
     loop {
         let Some(frame_result) = client_stream.next().await else {
@@ -68,7 +67,6 @@ pub async fn handle_connection(
                 let cmd_count = cmd_count.clone();
                 let resp_count = resp_count.clone();
                 let response_tx = response_tx.clone();
-                let target_service = target_service.clone();
 
                 cmd_count.fetch_add(1, Ordering::Relaxed);
                 let command_id = Uuid::new_v4();
@@ -83,7 +81,7 @@ pub async fn handle_connection(
 
                 let is_doc_command = frame == *DOC_REQUEST;
 
-                match target_service.lock().await.call(frame).await {
+                match target_service.call(frame).await {
                     Ok(mut response_stream) => {
                         // Spawn a task to handle this response stream
                         tokio::spawn(async move {
