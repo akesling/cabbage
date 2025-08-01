@@ -8,27 +8,9 @@ use futures_util::{SinkExt, StreamExt};
 use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::codec::Framed;
 use tower::Service;
-
-pub struct FrameStream {
-    receiver: mpsc::Receiver<BytesFrame>,
-}
-
-impl FrameStream {
-    fn new(buffer_size: usize) -> (mpsc::Sender<BytesFrame>, Self) {
-        let (sender, receiver) = mpsc::channel(buffer_size);
-        (sender, Self { receiver })
-    }
-}
-
-impl Stream for FrameStream {
-    type Item = BytesFrame;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_recv(cx)
-    }
-}
 
 struct RequestMessage {
     frame: BytesFrame,
@@ -73,7 +55,7 @@ impl Service<BytesFrame> for Resp2Backend {
         let request_sender = self.request_sender.clone();
 
         let fut = async move {
-            let (response_sender, responses) = FrameStream::new(100);
+            let (response_sender, response_receiver) = mpsc::channel(100);
 
             let request = RequestMessage {
                 frame: req,
@@ -83,7 +65,8 @@ impl Service<BytesFrame> for Resp2Backend {
                 bail!("Failed to send request to handler: {}", e);
             }
 
-            let r: Self::Response = Box::new(responses);
+            let response_stream = ReceiverStream::new(response_receiver);
+            let r: Self::Response = Box::new(response_stream);
             Ok(r)
         };
 
