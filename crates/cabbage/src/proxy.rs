@@ -1,4 +1,7 @@
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll};
 
 use anyhow::bail;
@@ -10,6 +13,7 @@ use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::{bytes::Bytes, codec::Framed};
+use tower::Layer;
 use tower::Service;
 use uuid::Uuid;
 
@@ -45,7 +49,11 @@ pub async fn handle_connection(
     let response_count = Arc::new(AtomicU64::new(0));
 
     // Create channel for response stream routing
-    let (stream_tx, mut stream_rx) = mpsc::channel::<(FrameStream, Uuid, bool)>(100);
+    let (stream_tx, mut stream_rx) = mpsc::channel::<(
+        Box<dyn Stream<Item = BytesFrame> + Send + Unpin>,
+        Uuid,
+        bool,
+    )>(100);
 
     // Spawn single task to handle response streams and forward to client
     let forward_task = tokio::spawn(async move {
@@ -275,7 +283,7 @@ impl Stream for FrameStream {
 }
 
 impl Service<BytesFrame> for Resp2Backend {
-    type Response = FrameStream;
+    type Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>;
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -297,55 +305,118 @@ impl Service<BytesFrame> for Resp2Backend {
                 bail!("Failed to send request to handler: {}", e);
             }
 
-            Ok(responses)
+            let r: Self::Response = Box::new(responses);
+            Ok(r)
         };
 
         Box::pin(fut)
     }
 }
 
-struct DocElisionLayer {}
-
-struct DocElider<S: Service<BytesFrame, Response=FrameStream>> {
-    resp2_service: S,
+struct ProxyLoggerLayer<'conn> {
+    connection_id: &'conn str,
 }
-impl<S: Service<BytesFrame, Response=FrameStream>> Service<BytesFrame> for DocElider<S> {
-    type Response = FrameStream;
-    type Error = S::Error;
-    type Future = S::Future;
+impl<'conn, S> Layer<S> for ProxyLoggerLayer<'conn>
+where
+    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
+{
+    type Service = ProxyLogger<'conn, S>;
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
+    fn layer(&self, service: S) -> Self::Service {
+        ProxyLogger::new(service, self.connection_id)
+    }
+}
+
+struct ProxyLogger<
+    'conn,
+    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
+> {
+    resp2_service: S,
+    connection_id: &'conn str,
+    request_count: u64,
+    response_count: Arc<AtomicU64>,
+}
+
+impl<'conn, S> ProxyLogger<'conn, S>
+where
+    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
+{
+    fn new(resp2_service: S, connection_id: &'conn str) -> Self {
+        Self {
+            resp2_service,
+            connection_id,
+            request_count: 0,
+            response_count: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl<'conn, S> Service<BytesFrame> for ProxyLogger<'conn, S>
+where
+    S: Service<BytesFrame, Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>>,
+    S::Error: Into<anyhow::Error>,
+    S::Future: Send + 'static,
+{
+    type Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>;
+    type Error = anyhow::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.resp2_service.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, req: BytesFrame) -> Self::Future {
-        async move {
-            let is_doc_command = req == *DOC_REQUEST;
-            let resp_stream = self.resp2_service.call(req).await;
-            if is_doc_command {
-                log::info!(
-                    concat!(
-                        "Target -> Client: ",
-                        "conn={} response #{} (last command #{}) - documents"
-                    ),
-                    connection_id,
-                    response_num,
-                    command_id_str
-                );
-            } else {
-                log::info!(
-                    concat!(
-                        "Target -> Client: ",
-                        "conn={} response #{} (last command #{}) - {:?}"
-                    ),
-                    connection_id,
-                    response_num,
-                    command_id_str,
-                    response_frame
-                );
-            }
-            resp_stream
-        }
+        self.request_count += 1;
+        let is_doc_command = req == *DOC_REQUEST;
+        let command_id = Uuid::new_v4();
+        let command_id_str = command_id.to_string();
+        let connection_id = self.connection_id.to_string();
+
+        log::info!(
+            concat!("Client -> Target: ", "conn={} command={} - {:?}"),
+            connection_id,
+            command_id_str,
+            req
+        );
+
+        let fut = self.resp2_service.call(req);
+
+        let resp_count = self.response_count.clone();
+        Box::pin(async move {
+            let response_num = resp_count.load(atomic::Ordering::Relaxed);
+            let base_stream = fut.await.map_err(Into::into)?;
+
+            // Use Box::pin to make the mapped stream Unpin
+            let mapped_stream = base_stream.map(move |resp| {
+                if is_doc_command {
+                    log::info!(
+                        concat!(
+                            "Target -> Client: ",
+                            "conn={} response #{} (last command #{}) - documents"
+                        ),
+                        connection_id,
+                        response_num,
+                        command_id_str
+                    );
+                } else {
+                    log::info!(
+                        concat!(
+                            "Target -> Client: ",
+                            "conn={} response #{} (last command #{}) - {:?}"
+                        ),
+                        connection_id,
+                        response_num,
+                        command_id_str,
+                        resp
+                    );
+                }
+                resp
+            });
+
+            let resp_stream: Box<dyn Stream<Item = BytesFrame> + Send + Unpin> =
+                Box::new(Box::pin(mapped_stream));
+            Ok(resp_stream)
+        })
     }
 }
 
