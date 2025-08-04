@@ -1,24 +1,23 @@
-use anyhow::bail;
+use std::pin::Pin;
+
+use futures::stream::Stream;
 use futures_util::{SinkExt, StreamExt};
-use lazy_static::lazy_static;
 use redis_protocol::{codec::Resp2, resp2::types::BytesFrame};
 use tokio::net::TcpStream;
-use tokio_util::{bytes::Bytes, codec::Framed};
+use tokio::sync::mpsc;
+use tokio_util::codec::Framed;
+use tower::Layer;
+use tower::Service;
 use uuid::Uuid;
 
-lazy_static! {
-    static ref DOC_REQUEST: BytesFrame = BytesFrame::Array(vec![
-        BytesFrame::BulkString(Bytes::from_static(b"COMMAND")),
-        BytesFrame::BulkString(Bytes::from_static(b"DOCS")),
-    ]);
-}
+static MAX_OUTSTANDING_RESPONSE_STREAMS: usize = 100;
 
+// TODO(akesling): Add connection timeout, etc.
 pub async fn handle_connection(
     client_socket: TcpStream,
     target_addr: String,
     connection_id: Uuid,
 ) -> anyhow::Result<()> {
-    // Connect to target server
     let target_socket = TcpStream::connect(&target_addr).await?;
     log::info!(
         "connection {connection_id}: connected with target at: {}",
@@ -28,92 +27,61 @@ pub async fn handle_connection(
     let client_framed = Framed::new(client_socket, Resp2::default());
     let target_framed = Framed::new(target_socket, Resp2::default());
 
-    let (mut client_sink, mut client_stream) = client_framed.split();
-    let (mut target_sink, mut target_stream) = target_framed.split();
+    let (client_sink, mut client_stream) = client_framed.split();
+    let connection_id_string = connection_id.to_string();
+    let logger = crate::middleware::ProxyLoggerLayer::new(&connection_id_string);
+    let mut target_service = logger.layer(crate::service::Resp2Backend::new(target_framed));
 
-    let mut _command_count = 0u64;
-    let mut last_command: Option<Uuid> = None;
-    let mut response_count = 0u64;
-
-    let mut client_next = Box::pin(client_stream.next());
-    let mut target_next = Box::pin(target_stream.next());
-
-    let mut is_doc_command = false;
-
-    loop {
-        tokio::select! {
-            // Handle frames from client -> target
-            frame_result = &mut client_next => {
-                match frame_result {
-                    Some(Ok(frame)) => {
-                        _command_count += 1;
-                        last_command = Some(Uuid::new_v4());
-
-                        let command_id_str = last_command.map(
-                            |u| u.to_string()).unwrap_or("UNKNOWN".to_string());
-                        log::info!(
-                            concat!(
-                                "Client -> Target: ",
-                                "conn={} command={} - {:?}"),
-                            connection_id, command_id_str, frame);
-
-                        is_doc_command = frame == *DOC_REQUEST;
-
-                        if let Err(e) = target_sink.send(frame).await {
-                            bail!("Failed to send command to target: {}", e);
-                        }
-
-                        client_next = Box::pin(client_stream.next());
-                    }
-                    Some(Err(e)) => {
-                        bail!("Error reading from client: {}", e);
-                    }
-                    None => {
-                        log::info!("Client connection closed");
-                        break;
-                    }
-                }
-            }
-
-            // Handle frames from target -> client
-            frame_result = &mut target_next => {
-                match frame_result {
-                    Some(Ok(frame)) => {
-                        response_count += 1;
-                        let command_id_str = last_command.map(
-                            |u| u.to_string()).unwrap_or("UNKNOWN".to_string());
-
-                        if is_doc_command {
-                            log::info!(
-                                concat!(
-                                    "Target -> Client: ",
-                                    "conn={} response #{} (last command #{}) - documents"),
-                                connection_id, response_count, command_id_str);
-                        } else {
-                            log::info!(
-                                concat!(
-                                    "Target -> Client: ",
-                                    "conn={} response #{} (last command #{}) - {:?}"),
-                                connection_id, response_count, command_id_str, frame);
-                        }
-
-                        if let Err(e) = client_sink.send(frame).await {
-                            bail!("Failed to send response to client: {}", e);
-                        }
-                        target_next = Box::pin(target_stream.next());
-                    }
-                    Some(Err(e)) => {
-                        bail!("Error reading from target: {}", e);
-                    }
-                    None => {
-                        log::info!("Target connection closed");
-                        break;
-                    }
+    let (response_forwarder_tx, mut response_forwarder_rx) = mpsc::channel::<
+        Box<dyn Stream<Item = BytesFrame> + Send>,
+    >(MAX_OUTSTANDING_RESPONSE_STREAMS);
+    let forward_task_join_handle = tokio::spawn(async move {
+        let mut client_sink = client_sink;
+        // Flatten streams of responses --
+        // they interleave as req > [ resp > resp > resp ] > req > ...  This takes the stream of
+        // streams and flattens it.
+        while let Some(response_stream) = response_forwarder_rx.recv().await {
+            let mut pinned = Pin::from(response_stream);
+            while let Some(response_frame) = pinned.as_mut().next().await {
+                if client_sink.send(response_frame).await.is_err() {
+                    log::error!("Failed to send response to client on connection {connection_id}");
+                    return;
                 }
             }
         }
+    });
+
+    while let Some(frame_result) = client_stream.next().await {
+        match frame_result {
+            Ok(frame) => {
+                match target_service.call(frame).await {
+                    Ok(response_stream) => {
+                        // Response streams are flattened by the response forwarder
+                        if response_forwarder_tx.send(response_stream).await.is_err() {
+                            log::error!("Failed to send response stream to handler");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send command to backend: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("Error reading from client: {}", e);
+                break;
+            }
+        }
+    }
+
+    // Close channel and wait for task to complete
+    drop(response_forwarder_tx);
+    if let Err(e) = forward_task_join_handle.await {
+        log::error!("Forward task failed: {}", e);
     }
 
     log::info!("Connection closed");
     Ok(())
 }
+
+// TODO(akesling): Implement a "serve()" function which takes a "Listener" and a MakeService
