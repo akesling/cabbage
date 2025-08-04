@@ -1,4 +1,6 @@
+pub mod middleware;
 pub mod proxy;
+pub mod service;
 
 use anyhow::anyhow;
 
