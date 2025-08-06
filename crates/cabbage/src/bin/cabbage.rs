@@ -89,6 +89,7 @@ struct ProxyOptions {
     target: String,
 }
 
+// TODO(akesling): Add connection timeout, etc.
 async fn create_proxy_service(
     client_addr: SocketAddr,
     target_addr: String,
@@ -106,10 +107,8 @@ async fn create_proxy_service(
         target_addr
     );
 
-    let target_framed = tokio_util::codec::Framed::new(
-        target_socket,
-        redis_protocol::codec::Resp2::default(),
-    );
+    let target_framed =
+        tokio_util::codec::Framed::new(target_socket, redis_protocol::codec::Resp2::default());
     let connection_id_string = connection_id.to_string();
     let logger = ProxyLoggerLayer::new(connection_id_string);
     let service = logger.layer(Resp2Backend::new(target_framed));
