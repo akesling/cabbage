@@ -62,11 +62,11 @@ impl<S> ProxyLogger<S> {
 impl<S> Service<BytesFrame> for ProxyLogger<S>
 where
     S: Service<BytesFrame>,
-    S::Response: Stream<Item = BytesFrame> + Send + 'static,
+    S::Response: Stream<Item = BytesFrame> + Send + Unpin + 'static,
     S::Error: Into<anyhow::Error> + 'static,
     S::Future: Send + 'static,
 {
-    type Response = Box<dyn Stream<Item = BytesFrame> + Send>;
+    type Response = Box<dyn Stream<Item = BytesFrame> + Send + Unpin>;
     type Error = anyhow::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -115,7 +115,7 @@ where
                     }
                 });
 
-                Box::new(logged) as Self::Response
+                Box::new(Box::pin(logged)) as Self::Response
             })
             .map_err(Into::into),
         )

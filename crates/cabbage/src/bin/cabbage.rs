@@ -1,9 +1,14 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::SocketAddr};
 
 use anyhow::{Context as _, Ok, Result, bail};
-use cabbage::proxy::handle_connection;
+use cabbage::{
+    middleware::{ProxyLogger, ProxyLoggerLayer},
+    proxy::serve,
+    service::Resp2Backend,
+};
 use clap::Parser;
 use tokio::net::TcpListener;
+use tower::{Layer, service_fn};
 use uuid::Uuid;
 
 #[derive(clap::Parser, Debug)]
@@ -84,6 +89,34 @@ struct ProxyOptions {
     target: String,
 }
 
+async fn create_proxy_service(
+    client_addr: SocketAddr,
+    target_addr: String,
+) -> anyhow::Result<ProxyLogger<Resp2Backend>> {
+    let connection_id = Uuid::new_v4();
+    log::info!("New connection from {} (ID#{})", client_addr, connection_id);
+
+    let target_socket = tokio::net::TcpStream::connect(&target_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to target {}: {}", target_addr, e))?;
+
+    log::info!(
+        "connection {}: connected with target at: {}",
+        connection_id,
+        target_addr
+    );
+
+    let target_framed = tokio_util::codec::Framed::new(
+        target_socket,
+        redis_protocol::codec::Resp2::default(),
+    );
+    let connection_id_string = connection_id.to_string();
+    let logger = ProxyLoggerLayer::new(connection_id_string);
+    let service = logger.layer(Resp2Backend::new(target_framed));
+
+    Ok(service)
+}
+
 async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Result<()> {
     let client_listener = TcpListener::bind(options.client.clone()).await?;
 
@@ -93,19 +126,13 @@ async fn proxy(_context: &GlobalOptions, options: &ProxyOptions) -> anyhow::Resu
         options.target
     );
 
-    loop {
-        let (client_socket, client_addr) = client_listener.accept().await?;
-        let target_addr = options.target.clone();
+    let target_addr = options.target.clone();
+    let make_service = service_fn(move |client_addr: SocketAddr| {
+        let target_addr = target_addr.clone();
+        async move { create_proxy_service(client_addr, target_addr).await }
+    });
 
-        let connection_id = Uuid::new_v4();
-        log::info!("New connection from {client_addr} (ID#{connection_id})");
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_socket, target_addr, connection_id).await {
-                log::error!("Connection error: {}", e);
-            }
-        });
-    }
+    serve(client_listener, make_service).await
 }
 
 #[derive(clap::Subcommand, Debug)]
