@@ -22,32 +22,34 @@ lazy_static! {
     ]);
 }
 
-pub struct ProxyLoggerLayer<'conn> {
-    connection_id: &'conn str,
+pub struct ProxyLoggerLayer {
+    connection_id: Arc<str>,
 }
-impl<'conn> ProxyLoggerLayer<'conn> {
-    pub fn new(connection_id: &'conn str) -> Self {
-        Self { connection_id }
+impl<'conn> ProxyLoggerLayer {
+    pub fn new(connection_id: String) -> Self {
+        Self {
+            connection_id: connection_id.into(),
+        }
     }
 }
 
-impl<'conn, S> Layer<S> for ProxyLoggerLayer<'conn> {
-    type Service = ProxyLogger<'conn, S>;
+impl<S> Layer<S> for ProxyLoggerLayer {
+    type Service = ProxyLogger<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        ProxyLogger::new(service, self.connection_id)
+        ProxyLogger::new(service, self.connection_id.clone())
     }
 }
 
-pub struct ProxyLogger<'conn, S> {
+pub struct ProxyLogger<S> {
     resp2_service: S,
-    connection_id: &'conn str,
+    connection_id: Arc<str>,
     request_count: u64,
     response_count: Arc<AtomicU64>,
 }
 
-impl<'conn, S> ProxyLogger<'conn, S> {
-    fn new(resp2_service: S, connection_id: &'conn str) -> Self {
+impl<S> ProxyLogger<S> {
+    fn new(resp2_service: S, connection_id: Arc<str>) -> Self {
         Self {
             resp2_service,
             connection_id,
@@ -57,7 +59,7 @@ impl<'conn, S> ProxyLogger<'conn, S> {
     }
 }
 
-impl<'conn, S> Service<BytesFrame> for ProxyLogger<'conn, S>
+impl<S> Service<BytesFrame> for ProxyLogger<S>
 where
     S: Service<BytesFrame>,
     S::Response: Stream<Item = BytesFrame> + Send + 'static,

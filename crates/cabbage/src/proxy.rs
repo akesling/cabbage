@@ -29,7 +29,7 @@ pub async fn handle_connection(
 
     let (client_sink, mut client_stream) = client_framed.split();
     let connection_id_string = connection_id.to_string();
-    let logger = crate::middleware::ProxyLoggerLayer::new(&connection_id_string);
+    let logger = crate::middleware::ProxyLoggerLayer::new(connection_id_string);
     let mut target_service = logger.layer(crate::service::Resp2Backend::new(target_framed));
 
     let (response_forwarder_tx, mut response_forwarder_rx) = mpsc::channel::<
