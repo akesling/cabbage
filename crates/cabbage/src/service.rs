@@ -1,4 +1,6 @@
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
 use anyhow::bail;
@@ -32,6 +34,8 @@ enum Message {
 
 pub struct Resp2Backend {
     request_sender: mpsc::Sender<Message>,
+
+    backend_running: Arc<AtomicBool>,
 }
 
 impl Resp2Backend {
@@ -39,9 +43,19 @@ impl Resp2Backend {
         let (request_sender, request_receiver) =
             mpsc::channel::<Message>(MAX_OUTSTANDING_REQUEST_MESSAGES);
 
-        tokio::spawn(backend_task(target_framed, request_receiver));
+        // Would like to initilize as false. Initilized to true to avoid race condition when starting a connection.
+        let backend_running = Arc::new(AtomicBool::new(true));
 
-        Self { request_sender }
+        tokio::spawn(backend_task(
+            target_framed,
+            request_receiver,
+            backend_running.clone(),
+        ));
+
+        Self {
+            request_sender,
+            backend_running,
+        }
     }
 }
 
@@ -51,6 +65,10 @@ impl Service<BytesFrame> for Resp2Backend {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if !self.backend_running.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(anyhow::anyhow!("Backend task has died")));
+        }
+
         Poll::Ready(Ok(()))
     }
 
@@ -79,12 +97,15 @@ impl Service<BytesFrame> for Resp2Backend {
 async fn backend_task(
     target_framed: Framed<TcpStream, Resp2>,
     mut request_receiver: mpsc::Receiver<Message>,
+    backend_running: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let (mut sender, mut receiver) = target_framed.split();
     let mut current_response_sender: Option<mpsc::Sender<BytesFrame>> = None;
 
     let mut response_next = Box::pin(receiver.next());
     let mut close_sender: Option<tokio::sync::oneshot::Sender<Framed<TcpStream, Resp2>>> = None;
+    backend_running.store(true, Ordering::Relaxed);
+
     loop {
         tokio::select! {
             request = request_receiver.recv() => {
@@ -133,6 +154,8 @@ async fn backend_task(
             }
         }
     }
+
+    backend_running.store(false, Ordering::Relaxed);
 
     if let Some(conn_sender) = close_sender {
         let framed = sender.reunite(receiver)?;
